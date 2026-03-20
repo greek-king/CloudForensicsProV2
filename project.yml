@@ -1,0 +1,660 @@
+// Services/LogParser.swift
+// Parses REAL cloud sync logs from iCloud, Google Drive, Dropbox, OneDrive
+// Supports file import, paste, and iCloud Drive file picker
+
+import Foundation
+
+class LogParser {
+
+    // MARK: - Main Parse Entry Point
+
+    func parse(text: String, provider: CloudProvider) -> ParseResult {
+        let lines = text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        var events: [FileEvent] = []
+        var errors: [String] = []
+
+        for (lineNum, line) in lines.enumerated() {
+            guard !line.hasPrefix("#"), !line.hasPrefix("//") else { continue }
+            do {
+                if let event = try parseLine(line, provider: provider) {
+                    events.append(event)
+                }
+            } catch {
+                if errors.count < 20 {
+                    errors.append("Line \(lineNum + 1): \(error.localizedDescription)")
+                }
+            }
+        }
+
+        events.sort { $0.timestamp < $1.timestamp }
+        let analyzed = detectAnomalies(in: events)
+
+        return ParseResult(
+            events: analyzed,
+            errors: errors,
+            provider: provider,
+            linesProcessed: lines.count,
+            eventsFound: analyzed.count
+        )
+    }
+
+    // MARK: - Auto-detect provider from log content
+
+    func autoDetectProvider(from text: String) -> CloudProvider {
+        let sample = String(text.prefix(2000)).lowercased()
+        if sample.contains("clouddocs") || sample.contains("ubiquity") || sample.contains("icloud") { return .iCloud }
+        if sample.contains("\"actor\"") && sample.contains("\"email\"") { return .googleDrive }
+        if sample.contains("file_ops.") || sample.contains("dropbox") { return .dropbox }
+        if sample.contains("useriprincipalname") || sample.contains("sharepoint") || sample.contains("onedrive") { return .oneDrive }
+        if sample.contains("box.com") || sample.contains("box_event") { return .box }
+        return .unknown
+    }
+
+    // MARK: - Route to Provider Parser
+
+    private func parseLine(_ line: String, provider: CloudProvider) throws -> FileEvent? {
+        switch provider {
+        case .iCloud:      return try parseICloudLine(line)
+        case .googleDrive: return try parseGoogleDriveLine(line)
+        case .dropbox:     return try parseDropboxLine(line)
+        case .oneDrive:    return try parseOneDriveLine(line)
+        case .box:         return try parseBoxLine(line)
+        case .unknown:     return try parseGenericLine(line)
+        }
+    }
+
+    // MARK: - iCloud Log Parser
+    // Supports Apple System Log (ASL), Console.app exports, and CloudDocs format
+    // Format: 2024-01-15T14:23:45Z [INFO] CloudDocs: file_op=UPLOAD path=/Documents/report.pdf size=2048000 device=iPhone-14 user=apple@example.com
+
+    private func parseICloudLine(_ line: String) throws -> FileEvent? {
+        guard line.contains("CloudDocs") || line.contains("iCloud") ||
+              line.contains("UBIQUITY") || line.contains("bird") ||
+              line.contains("nsurlsessiond") || line.contains("cloudd") else { return nil }
+
+        let timestamp = extractTimestamp(from: line) ?? Date()
+        let eventType = extractICloudEventType(from: line)
+        let path = extractValue(from: line, key: "path") ??
+                   extractValue(from: line, key: "file") ??
+                   extractFilenameFromLine(line) ?? "Unknown"
+        let fileName = URL(fileURLWithPath: path).lastPathComponent
+        let size = extractValue(from: line, key: "size").flatMap { Int64($0) }
+        let device = extractValue(from: line, key: "device") ?? extractValue(from: line, key: "deviceName")
+        let user = extractValue(from: line, key: "user") ?? extractValue(from: line, key: "account")
+        let ip = extractValue(from: line, key: "ip") ?? extractIPAddress(from: line)
+
+        return FileEvent(
+            id: UUID(), provider: .iCloud, eventType: eventType,
+            fileName: fileName.isEmpty ? path : fileName, filePath: path,
+            fileSize: size, timestamp: timestamp, userID: user,
+            ipAddress: ip, deviceName: device,
+            deviceOS: extractValue(from: line, key: "os"),
+            checksum: extractValue(from: line, key: "hash") ?? extractValue(from: line, key: "checksum"),
+            previousPath: extractValue(from: line, key: "prev_path"),
+            sharedWith: nil, isAnomaly: false, anomalyReason: nil, rawLogLine: line
+        )
+    }
+
+    private func extractICloudEventType(from line: String) -> FileEventType {
+        let u = line.uppercased()
+        if u.contains("UPLOAD") || u.contains("PUT")      { return .uploaded }
+        if u.contains("DOWNLOAD") || u.contains("GET")    { return .downloaded }
+        if u.contains("DELETE") || u.contains("REMOVE")   { return .deleted }
+        if u.contains("MOVE")                              { return .moved }
+        if u.contains("RENAME")                            { return .renamed }
+        if u.contains("SHARE") || u.contains("COLLAB")    { return .shared }
+        if u.contains("CREATE") || u.contains("NEW")      { return .created }
+        if u.contains("MODIFY") || u.contains("EDIT")     { return .modified }
+        if u.contains("ACCESS") || u.contains("READ")     { return .accessed }
+        if u.contains("RESTORE") || u.contains("RECOVER") { return .restored }
+        return .accessed
+    }
+
+    // MARK: - Google Drive Log Parser
+    // Supports Google Workspace Admin Reports API JSON format
+    // Also supports Google Takeout activity logs
+
+    private func parseGoogleDriveLine(_ line: String) throws -> FileEvent? {
+        if line.hasPrefix("{"), let data = line.data(using: .utf8) {
+            return try parseGoogleDriveJSON(data)
+        }
+        // Google Takeout CSV format: date,actor,event_type,doc_title,visibility
+        if line.contains(",") && (line.lowercased().contains("drive") ||
+           line.lowercased().contains("doc") || line.lowercased().contains("sheet")) {
+            return try parseGoogleTakeoutCSV(line)
+        }
+        guard line.contains("drive") || line.contains("gdoc") else { return nil }
+        return try parseGenericLine(line, overrideProvider: .googleDrive)
+    }
+
+    private func parseGoogleDriveJSON(_ data: Data) throws -> FileEvent? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+
+        let timeStr = json["time"] as? String ?? json["timestamp"] as? String ?? ""
+        let timestamp = parseISO8601(timeStr) ?? Date()
+        let actor = json["actor"] as? [String: Any]
+        let email = actor?["email"] as? String ?? actor?["profileId"] as? String
+        let events = (json["events"] as? [[String: Any]])?.first
+        let eventName = events?["name"] as? String ?? events?["type"] as? String ?? "access"
+
+        var fileName = "Unknown"
+        var filePath = "/"
+        var fileSize: Int64? = nil
+        var sharedWith: [String]? = nil
+
+        if let params = events?["parameters"] as? [[String: Any]] {
+            for param in params {
+                let name = param["name"] as? String ?? ""
+                let value = param["value"] as? String ?? ""
+                switch name {
+                case "doc_title", "file_name", "source_file_name": fileName = value
+                case "doc_id", "file_id":                          filePath = "/\(value)"
+                case "file_size", "doc_size":                      fileSize = Int64(value)
+                case "target_user", "added_role_user":
+                    sharedWith = [value]
+                default: break
+                }
+            }
+        }
+
+        return FileEvent(
+            id: UUID(), provider: .googleDrive, eventType: mapGoogleEventName(eventName),
+            fileName: fileName, filePath: filePath, fileSize: fileSize,
+            timestamp: timestamp, userID: email,
+            ipAddress: json["ipAddress"] as? String,
+            deviceName: nil, deviceOS: nil, checksum: nil,
+            previousPath: nil, sharedWith: sharedWith,
+            isAnomaly: false, anomalyReason: nil,
+            rawLogLine: String(data: data, encoding: .utf8)
+        )
+    }
+
+    private func parseGoogleTakeoutCSV(_ line: String) throws -> FileEvent? {
+        // Google Takeout: "2024-01-15 14:23:45 UTC","user@gmail.com","view","Document Title","private"
+        let parts = line.components(separatedBy: "\",\"")
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) }
+        guard parts.count >= 3 else { return nil }
+
+        let timestamp = parseFlexibleDate(parts[0]) ?? Date()
+        let user = parts.count > 1 ? parts[1] : nil
+        let action = parts.count > 2 ? parts[2] : ""
+        let title = parts.count > 3 ? parts[3] : "Unknown"
+
+        return FileEvent(
+            id: UUID(), provider: .googleDrive,
+            eventType: mapGoogleEventName(action),
+            fileName: title, filePath: "/\(title)",
+            fileSize: nil, timestamp: timestamp,
+            userID: user, ipAddress: nil,
+            deviceName: nil, deviceOS: nil,
+            checksum: nil, previousPath: nil, sharedWith: nil,
+            isAnomaly: false, anomalyReason: nil, rawLogLine: line
+        )
+    }
+
+    private func mapGoogleEventName(_ name: String) -> FileEventType {
+        switch name.lowercased() {
+        case "view", "access", "preview":            return .accessed
+        case "edit", "change", "update":             return .modified
+        case "create", "add", "new", "copy":         return .created
+        case "delete", "trash", "remove", "purge":   return .deleted
+        case "download":                             return .downloaded
+        case "upload":                               return .uploaded
+        case "move":                                 return .moved
+        case "rename":                               return .renamed
+        case "share", "acl_change", "add_to_folder": return .shared
+        case "restore", "untrash":                   return .restored
+        default:                                     return .accessed
+        }
+    }
+
+    // MARK: - Dropbox Log Parser
+    // Supports Dropbox Business Activity Log CSV export
+    // Format: Timestamp | Member email | Event type | Path | Additional info
+
+    private func parseDropboxLine(_ line: String) throws -> FileEvent? {
+        // Dropbox CSV export: "2024-01-15 14:23:45","user@company.com","File upload","/path/to/file.pdf","192.168.1.1"
+        if line.contains(",") && !line.hasPrefix("{") {
+            let parts = line.components(separatedBy: "\",\"")
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) }
+            if parts.count >= 3 {
+                let timestamp = parseFlexibleDate(parts[0]) ?? Date()
+                let user = parts.count > 1 ? parts[1] : nil
+                let action = parts.count > 2 ? parts[2] : ""
+                let path = parts.count > 3 ? parts[3] : "Unknown"
+                let ip = parts.count > 4 ? parts[4] : nil
+                let fileName = URL(fileURLWithPath: path).lastPathComponent
+
+                return FileEvent(
+                    id: UUID(), provider: .dropbox,
+                    eventType: mapDropboxAction(action),
+                    fileName: fileName.isEmpty ? path : fileName,
+                    filePath: path, fileSize: nil,
+                    timestamp: timestamp, userID: user,
+                    ipAddress: ip, deviceName: parts.count > 5 ? parts[5] : nil,
+                    deviceOS: nil, checksum: nil,
+                    previousPath: nil, sharedWith: nil,
+                    isAnomaly: false, anomalyReason: nil, rawLogLine: line
+                )
+            }
+        }
+
+        // Pipe-separated format
+        if line.contains("|") {
+            let parts = line.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count >= 3 else { return nil }
+            let timestamp = parseFlexibleDate(parts[0]) ?? Date()
+            let user = parts.count > 1 ? parts[1] : nil
+            let action = parts.count > 2 ? parts[2] : ""
+            let path = parts.count > 3 ? parts[3] : "Unknown"
+            let fileName = URL(fileURLWithPath: path).lastPathComponent
+            let sizeStr = parts.count > 4 ? parts[4].components(separatedBy: " ").first : nil
+
+            return FileEvent(
+                id: UUID(), provider: .dropbox,
+                eventType: mapDropboxAction(action),
+                fileName: fileName.isEmpty ? path : fileName,
+                filePath: path,
+                fileSize: sizeStr.flatMap { Int64($0) },
+                timestamp: timestamp, userID: user,
+                ipAddress: parts.count > 5 ? parts[5] : nil,
+                deviceName: parts.count > 6 ? parts[6] : nil,
+                deviceOS: nil, checksum: nil,
+                previousPath: nil, sharedWith: nil,
+                isAnomaly: false, anomalyReason: nil, rawLogLine: line
+            )
+        }
+
+        guard line.lowercased().contains("dropbox") || line.contains("file_ops") else { return nil }
+        return try parseGenericLine(line, overrideProvider: .dropbox)
+    }
+
+    private func mapDropboxAction(_ action: String) -> FileEventType {
+        let a = action.lowercased()
+        if a.contains("upload") || a.contains("add")      { return .uploaded }
+        if a.contains("download")                          { return .downloaded }
+        if a.contains("delete") || a.contains("remove")   { return .deleted }
+        if a.contains("move")                              { return .moved }
+        if a.contains("rename")                            { return .renamed }
+        if a.contains("share") || a.contains("link")      { return .shared }
+        if a.contains("edit") || a.contains("modify")     { return .modified }
+        if a.contains("create") || a.contains("folder")   { return .created }
+        if a.contains("restore")                           { return .restored }
+        if a.contains("view") || a.contains("preview")    { return .accessed }
+        return .accessed
+    }
+
+    // MARK: - OneDrive / SharePoint Log Parser
+    // Supports Microsoft 365 Compliance Center Audit Log CSV
+    // Format: CreationTime,UserPrincipalName,Operation,FileName,FilePath,FileSize,ClientIP,DeviceName
+
+    private func parseOneDriveLine(_ line: String) throws -> FileEvent? {
+        guard line.contains("OneDrive") || line.contains("SharePoint") ||
+              line.contains("FileUploaded") || line.contains("FileDeleted") ||
+              line.contains("FileMoved") || line.contains("FileDownloaded") ||
+              (line.contains(",") && line.lowercased().contains("file")) else { return nil }
+
+        // Microsoft 365 Compliance CSV format
+        let parts = splitCSV(line)
+        var dict: [String: String] = [:]
+
+        // Try comma-separated key=value pairs
+        if parts.count >= 4 {
+            // Header row detection
+            if parts[0].lowercased() == "creationtime" { return nil }
+
+            // Standard M365 CSV: CreationTime, UserIds, Operations, AuditData...
+            let timestamp = parseFlexibleDate(parts[0]) ?? Date()
+            let user = parts.count > 1 ? parts[1] : nil
+            let operation = parts.count > 2 ? parts[2] : ""
+
+            // Try to parse embedded JSON in AuditData column
+            if parts.count > 3 {
+                let auditData = parts[3]
+                if auditData.hasPrefix("{"), let data = auditData.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let fileName = json["SourceFileName"] as? String ??
+                                   json["ObjectId"] as? String ?? "Unknown"
+                    let filePath = json["SourceRelativeUrl"] as? String ??
+                                   json["ObjectId"] as? String ?? "/"
+                    let size = json["FileSizeBytes"] as? Int64 ??
+                               (json["FileSizeBytes"] as? String).flatMap { Int64($0) }
+                    let ip = json["ClientIP"] as? String
+                    let device = json["DeviceName"] as? String
+
+                    return FileEvent(
+                        id: UUID(), provider: .oneDrive,
+                        eventType: mapOneDriveOperation(operation),
+                        fileName: URL(fileURLWithPath: fileName).lastPathComponent,
+                        filePath: filePath, fileSize: size,
+                        timestamp: timestamp, userID: user,
+                        ipAddress: ip, deviceName: device,
+                        deviceOS: json["DeviceOS"] as? String,
+                        checksum: json["DocumentId"] as? String,
+                        previousPath: json["DestinationFileName"] as? String,
+                        sharedWith: nil, isAnomaly: false, anomalyReason: nil,
+                        rawLogLine: line
+                    )
+                }
+            }
+
+            // Simple CSV fallback
+            let fileName = parts.count > 3 ? parts[3] : "Unknown"
+            let filePath = parts.count > 4 ? parts[4] : "/"
+            let size = parts.count > 5 ? Int64(parts[5]) : nil
+            let ip = parts.count > 6 ? parts[6] : nil
+            let device = parts.count > 7 ? parts[7] : nil
+
+            return FileEvent(
+                id: UUID(), provider: .oneDrive,
+                eventType: mapOneDriveOperation(operation),
+                fileName: fileName, filePath: filePath,
+                fileSize: size, timestamp: timestamp,
+                userID: user, ipAddress: ip, deviceName: device,
+                deviceOS: nil, checksum: nil, previousPath: nil,
+                sharedWith: nil, isAnomaly: false, anomalyReason: nil,
+                rawLogLine: line
+            )
+        }
+
+        return nil
+    }
+
+    private func splitCSV(_ line: String) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var inQuotes = false
+        for char in line {
+            if char == "\"" { inQuotes.toggle() }
+            else if char == "," && !inQuotes {
+                result.append(current.trimmingCharacters(in: CharacterSet(charactersIn: "\"")))
+                current = ""
+            } else { current.append(char) }
+        }
+        result.append(current.trimmingCharacters(in: CharacterSet(charactersIn: "\"")))
+        return result
+    }
+
+    private func mapOneDriveOperation(_ op: String) -> FileEventType {
+        switch op {
+        case "FileUploaded", "FileCheckedIn":               return .uploaded
+        case "FileDownloaded":                              return .downloaded
+        case "FileDeleted", "FileRecycled", "FileVersionsAllDeleted": return .deleted
+        case "FileMoved", "FileCopied":                     return .moved
+        case "FileRenamed":                                 return .renamed
+        case "FileCreated", "FolderCreated":                return .created
+        case "FileModified", "FileCheckedOut":              return .modified
+        case "SharingSet", "AnonymousLinkCreated",
+             "AddedToSecureLink", "SharingInvitationCreated": return .shared
+        case "FileRestored":                                return .restored
+        case "FileAccessed", "FilePreviewed",
+             "SearchQueryPerformed":                        return .accessed
+        default:                                            return .accessed
+        }
+    }
+
+    // MARK: - Box Log Parser
+    // Supports Box Admin Console event log CSV export
+
+    private func parseBoxLine(_ line: String) throws -> FileEvent? {
+        guard line.lowercased().contains("box") ||
+              line.contains("UPLOAD") || line.contains("DOWNLOAD") ||
+              line.contains("box_event") else { return nil }
+        return try parseGenericLine(line, overrideProvider: .box)
+    }
+
+    // MARK: - Generic / Fallback Parser
+
+    private func parseGenericLine(_ line: String, overrideProvider: CloudProvider? = nil) throws -> FileEvent? {
+        guard !line.isEmpty, line.count > 15 else { return nil }
+
+        let timestamp = extractTimestamp(from: line) ?? Date()
+        let eventType = extractICloudEventType(from: line)
+        let path = extractValue(from: line, key: "path") ??
+                   extractValue(from: line, key: "file") ??
+                   extractValue(from: line, key: "filename") ??
+                   extractFilenameFromLine(line) ?? "Unknown"
+        let fileName = URL(fileURLWithPath: path).lastPathComponent
+
+        return FileEvent(
+            id: UUID(), provider: overrideProvider ?? .unknown,
+            eventType: eventType,
+            fileName: fileName.isEmpty ? path : fileName,
+            filePath: path,
+            fileSize: extractValue(from: line, key: "size").flatMap { Int64($0) },
+            timestamp: timestamp,
+            userID: extractValue(from: line, key: "user") ?? extractValue(from: line, key: "email"),
+            ipAddress: extractIPAddress(from: line),
+            deviceName: extractValue(from: line, key: "device"),
+            deviceOS: extractValue(from: line, key: "os"),
+            checksum: extractValue(from: line, key: "hash") ?? extractValue(from: line, key: "md5"),
+            previousPath: extractValue(from: line, key: "from") ?? extractValue(from: line, key: "prev"),
+            sharedWith: nil, isAnomaly: false, anomalyReason: nil, rawLogLine: line
+        )
+    }
+
+    // MARK: - Anomaly Detection Engine
+
+    func detectAnomalies(in events: [FileEvent]) -> [FileEvent] {
+        var result = events
+        let calendar = Calendar.current
+
+        // 1. Mass deletion (>10 deletes within 1 hour)
+        let deletions = events.filter { $0.eventType == .deleted }
+        for deletion in deletions {
+            let window = events.filter {
+                $0.eventType == .deleted &&
+                abs($0.timestamp.timeIntervalSince(deletion.timestamp)) < 3600
+            }
+            if window.count > 10 {
+                if let i = result.firstIndex(where: { $0.id == deletion.id }) {
+                    result[i] = flagAnomaly(result[i], reason: "Mass deletion: \(window.count) files deleted in 1 hour")
+                }
+            }
+        }
+
+        // 2. Off-hours activity (11pm – 5am)
+        for event in events {
+            let hour = calendar.component(.hour, from: event.timestamp)
+            if hour >= 23 || hour < 5 {
+                if let i = result.firstIndex(where: { $0.id == event.id }) {
+                    result[i] = flagAnomaly(result[i], reason: "Off-hours activity at \(hour):00")
+                }
+            }
+        }
+
+        // 3. Sensitive file exfiltration
+        for event in events where event.isSensitiveFile {
+            if event.eventType == .deleted || event.eventType == .downloaded || event.eventType == .shared {
+                if let i = result.firstIndex(where: { $0.id == event.id }) {
+                    result[i] = flagAnomaly(result[i], reason: "Sensitive \(event.fileExtension.uppercased()) file \(event.eventType.rawValue.lowercased())")
+                }
+            }
+        }
+
+        // 4. Bulk download (>20 downloads in 30 min)
+        let downloads = events.filter { $0.eventType == .downloaded }
+        for download in downloads {
+            let window = events.filter {
+                $0.eventType == .downloaded &&
+                abs($0.timestamp.timeIntervalSince(download.timestamp)) < 1800
+            }
+            if window.count > 20 {
+                if let i = result.firstIndex(where: { $0.id == download.id }) {
+                    result[i] = flagAnomaly(result[i], reason: "Bulk download: \(window.count) files in 30 minutes")
+                }
+            }
+        }
+
+        // 5. External IP sharing
+        for event in events where event.eventType == .shared {
+            if let ip = event.ipAddress, isExternalIP(ip) {
+                if let i = result.firstIndex(where: { $0.id == event.id }) {
+                    result[i] = flagAnomaly(result[i], reason: "Shared from external IP: \(ip)")
+                }
+            }
+        }
+
+        // 6. Large file download (>100MB)
+        for event in events where event.eventType == .downloaded {
+            if let size = event.fileSize, size > 100_000_000 {
+                if let i = result.firstIndex(where: { $0.id == event.id }) {
+                    result[i] = flagAnomaly(result[i], reason: "Large file downloaded: \(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))")
+                }
+            }
+        }
+
+        // 7. Unknown device access
+        let knownDevices = Set(events.compactMap { $0.deviceName }.filter {
+            !$0.lowercased().contains("unknown")
+        })
+        if !knownDevices.isEmpty {
+            for event in events {
+                if let device = event.deviceName,
+                   device.lowercased().contains("unknown") || !knownDevices.contains(device) {
+                    if let i = result.firstIndex(where: { $0.id == event.id }) {
+                        result[i] = flagAnomaly(result[i], reason: "Activity from unrecognized device: \(device)")
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    func detectExfiltration(in events: [FileEvent]) -> [ExfiltrationPattern] {
+        var patterns: [ExfiltrationPattern] = []
+        let transfers = events.filter { $0.eventType == .downloaded || $0.eventType == .shared }
+        guard !transfers.isEmpty else { return [] }
+
+        var processed = Set<UUID>()
+        for event in transfers {
+            guard !processed.contains(event.id) else { continue }
+            let window = transfers.filter {
+                abs($0.timestamp.timeIntervalSince(event.timestamp)) < 1800
+            }
+            if window.count >= 5 {
+                let totalSize = window.compactMap { $0.fileSize }.reduce(0, +)
+                let ips = Set(window.compactMap { $0.ipAddress }).filter { isExternalIP($0) }
+                patterns.append(ExfiltrationPattern(
+                    suspectedFiles: window,
+                    totalSize: totalSize,
+                    timeWindow: 1800,
+                    destinationIPs: Array(ips),
+                    riskScore: min(100, window.count * 4 + (ips.isEmpty ? 0 : 30)),
+                    description: "\(window.count) files (\(ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file))) in 30 min"
+                ))
+                window.forEach { processed.insert($0.id) }
+            }
+        }
+        return patterns.sorted { $0.riskScore > $1.riskScore }
+    }
+
+    private func flagAnomaly(_ event: FileEvent, reason: String) -> FileEvent {
+        FileEvent(
+            id: event.id, provider: event.provider, eventType: event.eventType,
+            fileName: event.fileName, filePath: event.filePath, fileSize: event.fileSize,
+            timestamp: event.timestamp, userID: event.userID, ipAddress: event.ipAddress,
+            deviceName: event.deviceName, deviceOS: event.deviceOS, checksum: event.checksum,
+            previousPath: event.previousPath, sharedWith: event.sharedWith,
+            isAnomaly: true,
+            anomalyReason: event.anomalyReason != nil ? "\(event.anomalyReason!) | \(reason)" : reason,
+            rawLogLine: event.rawLogLine
+        )
+    }
+
+    private func isExternalIP(_ ip: String) -> Bool {
+        !ip.hasPrefix("192.168.") && !ip.hasPrefix("10.") &&
+        !ip.hasPrefix("172.16.") && ip != "127.0.0.1" && ip != "localhost"
+    }
+
+    // MARK: - Helpers
+
+    private func extractTimestamp(from line: String) -> Date? {
+        let patterns = [
+            #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?"#,
+            #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}( [+-]\d{4}| UTC| Z)?"#,
+            #"\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}"#,
+            #"\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}"#
+        ]
+        for pattern in patterns {
+            if let range = line.range(of: pattern, options: .regularExpression) {
+                let match = String(line[range])
+                if let date = parseFlexibleDate(match) { return date }
+            }
+        }
+        return nil
+    }
+
+    private func parseISO8601(_ string: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: string) { return d }
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        return f2.date(from: string)
+    }
+
+    private func parseFlexibleDate(_ string: String) -> Date? {
+        if let d = parseISO8601(string) { return d }
+        let formats = [
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm:ss Z",
+            "yyyy-MM-dd HH:mm:ss zzz",
+            "MM/dd/yyyy HH:mm:ss",
+            "dd/MM/yyyy HH:mm:ss",
+            "yyyy/MM/dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm:ss.SSS"
+        ]
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        for format in formats {
+            f.dateFormat = format
+            if let d = f.date(from: string.trimmingCharacters(in: .whitespaces)) { return d }
+        }
+        return nil
+    }
+
+    private func extractValue(from line: String, key: String) -> String? {
+        let patterns = [
+            "\(key)=([^\\s,;|]+)",
+            "\(key):\\s*([^\\s,;|]+)",
+            #""\#(key)"\s*:\s*"([^"]+)""#,
+            "\(key)=\\\"([^\\\"]+)\\\""
+        ]
+        for pattern in patterns {
+            if let range = line.range(of: pattern, options: [.regularExpression, .caseInsensitive]),
+               let capture = extractFirstCapture(from: String(line[range]), pattern: pattern) {
+                return capture
+            }
+        }
+        return nil
+    }
+
+    private func extractFirstCapture(from string: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+              let match = regex.firstMatch(in: string, range: NSRange(string.startIndex..., in: string)),
+              match.numberOfRanges > 1,
+              let range = Range(match.range(at: 1), in: string) else { return nil }
+        return String(string[range])
+    }
+
+    private func extractIPAddress(from line: String) -> String? {
+        let pattern = #"\b(?:\d{1,3}\.){3}\d{1,3}\b"#
+        if let range = line.range(of: pattern, options: .regularExpression) {
+            return String(line[range])
+        }
+        return nil
+    }
+
+    private func extractFilenameFromLine(_ line: String) -> String? {
+        let pattern = #"[/\\][\w\-. /\\]+"#
+        if let range = line.range(of: pattern, options: .regularExpression) {
+            return URL(fileURLWithPath: String(line[range])).lastPathComponent
+        }
+        return nil
+    }
+}
